@@ -1,0 +1,27 @@
+name: Esegui Astaradar
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Installa Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Installa dipendenze
+        run: |
+          pip install -r requirements.txt
+
+      - name: Esegui astaradar_run.py
+        run: python astaradar_run.py
