@@ -125,6 +125,8 @@ Rispondi SOLO con il JSON, senza testo aggiuntivo.
         )
 
         risposta = r.json()
+        print(f"  API risposta: {risposta}")
+
         testo = risposta["content"][0]["text"].strip()
 
         if testo.startswith("```"):
