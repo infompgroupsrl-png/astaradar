@@ -1,531 +1,164 @@
-"""
-Pipeline di analisi delle perizie con LLM parallelo:
-1) Prepara i testi delle perizie (OCR su PDF o riuso dei .txt esistenti)
-2) Calcola lo score iniziale con le regex per ogni asta
-3) Esegue l'analisi semantica con LLM IN PARALLELO sulle aste promettenti
-4) Salva lo score finale e l'esito nel database
-"""
-
+import os
 import sqlite3
-from pathlib import Path
 import json
-import re
-import time  # PATCH: aggiunto per backoff nei retry
-from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import base64
+import httpx
 
+from pathlib import Path
 from pdf2image import convert_from_path
-import pytesseract
 
-from analisi_llm import analizza_perizia_con_llm, unisci_score
+# ---------------------
+# CONFIG
+# ---------------------
 
+with open("config.json", "r", encoding="utf-8") as f:
+    config = json.load(f)
 
-# =========================================================
-# CONFIGURAZIONE
-# =========================================================
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY") or config.get("anthropic_api_key")
+PERIZIE_DIR = Path("perizie")
+TESTI_DIR = Path("testi")
+TESTI_DIR.mkdir(exist_ok=True)
 
-pytesseract.pytesseract.tesseract_cmd = (
-    r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-)
-POPPLER = r"C:\poppler\Library\bin"
+# ---------------------
+# DATABASE
+# ---------------------
 
-PERIZIE_DIR   = Path("perizie")
-TESTI_DIR     = Path("testi")
-CACHE_LLM_DIR = Path("cache_llm")
-LOG_FILE      = Path("log_analisi.txt")
+conn = sqlite3.connect("database/aste.db")
+cur = conn.cursor()
 
-for d in (PERIZIE_DIR, TESTI_DIR, CACHE_LLM_DIR):
-    d.mkdir(exist_ok=True)
+cur.execute("""
+SELECT id FROM aste
+WHERE analizzata = 0
+""")
 
-SOGLIA_LLM          = 40
-SOGLIA_INTERESSANTE = 75
-SOGLIA_DA_VALUTARE  = 40
-LLM_WORKERS         = 1  # PATCH: era 3 → 1 (CPU only, niente GPU NVIDIA)
+da_analizzare = cur.fetchall()
 
+print(f"Da analizzare: {len(da_analizzare)}")
 
-MAPPING_ESITI_LLM = {
-    "INTERESSANTE": "INTERESSANTE",
-    "DA_VALUTARE":  "DA VALUTARE",
-    "SCARTARE":     "SCARTARE",
+# ---------------------
+# ANALISI
+# ---------------------
+
+def analizza_perizia(id_asta):
+
+    pdf_file = PERIZIE_DIR / f"{id_asta}.pdf"
+    txt_file = TESTI_DIR / f"{id_asta}.txt"
+
+    immagini = []
+
+    if pdf_file.exists():
+
+        try:
+            pagine = convert_from_path(pdf_file, dpi=100, first_page=1, last_page=8)
+        except Exception as e:
+            print(f"Errore conversione PDF {id_asta}: {e}")
+            pagine = []
+
+        for pagina in pagine:
+            import io
+            buf = io.BytesIO()
+            pagina.save(buf, format="JPEG", quality=70)
+            b64 = base64.b64encode(buf.getvalue()).decode()
+            immagini.append({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/jpeg",
+                    "data": b64
+                }
+            })
+
+    testo_annuncio = ""
+
+    if txt_file.exists():
+        testo_annuncio = txt_file.read_text(encoding="utf-8", errors="ignore").strip()
+
+    if not immagini and not testo_annuncio:
+        return None, None, None
+
+    contenuto = []
+
+    if testo_annuncio:
+        contenuto.append({
+            "type": "text",
+            "text": f"Testo annuncio:\n{testo_annuncio}\n\n"
+        })
+
+    contenuto.extend(immagini)
+
+    contenuto.append({
+        "type": "text",
+        "text": """
+Sei un esperto immobiliare italiano specializzato in aste giudiziarie.
+Analizza questa perizia e rispondi SOLO con un JSON con questi campi:
+
+{
+  "esito": "INTERESSANTE" | "DA VALUTARE" | "SCARTARE",
+  "score": numero da 0 a 100,
+  "note": "stringa breve con motivazione"
 }
 
+Criteri:
+- SCARTARE: quota frazionaria, occupato, solo accessori (box/cantina/garage), abusi non sanabili, inagibile
+- DA VALUTARE: mancano info chiave o ci sono criticità parziali
+- INTERESSANTE: piena proprietà, libero o con locazione regolare, abitabile, prezzo conveniente
 
-# =========================================================
-# LOGGING
-# =========================================================
+Rispondi SOLO con il JSON, senza testo aggiuntivo.
+"""
+    })
 
-def log(msg: str):
-    ts   = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    riga = f"[{ts}] {msg}"
-    print(riga)
     try:
-        with open(LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(riga + "\n")
-    except Exception:
-        pass
 
-
-# =========================================================
-# FUNZIONI DI SUPPORTO
-# =========================================================
-
-def contiene(testo: str, parole: list) -> bool:
-    return any(p in testo for p in parole)
-
-def trova_regex(testo: str, patterns: list) -> bool:
-    return any(re.search(p, testo) for p in patterns)
-
-def normalizza(testo: str) -> str:
-    return (
-        testo.lower()
-        .replace("Ã ","a").replace("Ã¨","e").replace("Ã©","e")
-        .replace("Ã¬","i").replace("Ã²","o").replace("Ã¹","u")
-    )
-
-def trova_quota_frazionaria(testo: str):
-    patterns = [
-        r"quota\s+(?:di|pari\s+a|del|della)?\s*(\d+)\s*/\s*(\d+)",
-        r"per\s+la\s+quota\s+(?:di|pari\s+a|del|della)?\s*(\d+)\s*/\s*(\d+)",
-        r"quota\s+indivisa\s+(?:di|pari\s+a|del|della)?\s*(\d+)\s*/\s*(\d+)",
-        r"quote?\s+indivise?\s+pari\s+a\s*(\d+)\s*/\s*(\d+)",
-        r"proprieta'?[\s:]+(\d+)\s*/\s*(\d+)",
-        r"(\d+)\s*/\s*(\d+)\s+del\s+presente\s+lotto",
-        r"(\d+)\s*/\s*(\d+)\s+(?:di|della|dell')?\s*piena\s+proprieta",
-        r"piena\s+proprieta\s+(?:per|di|della|del)?\s*(\d+)\s*/\s*(\d+)",
-    ]
-    for pattern in patterns:
-        for m in re.finditer(pattern, testo):
-            contesto = testo[max(0, m.start()-120):m.end()+120]
-            if "ciascuno" in contesto or "ciascuna" in contesto:
-                continue
-            if "attuali proprietari" in contesto or "precedenti proprietari" in contesto:
-                continue
-            n, d = int(m.group(1)), int(m.group(2))
-            if d > 0 and n < d:
-                return n, d
-    return None
-
-def ha_quota_intera(testo: str) -> bool:
-    return (
-        re.search(r"\b1\s*/\s*1\b", testo) is not None
-        or "intera proprieta"          in testo
-        or "intera piena proprieta"    in testo
-        or "piena proprieta per l'intero" in testo
-        or "piena proprieta dell'intero"  in testo
-    )
-
-
-# =========================================================
-# SCORING REGEX  â€”  regole aggiornate
-# =========================================================
-
-def calcola_score_regex(testo: str) -> int:
-    t = normalizza(testo)
-
-    # --------------------------------------------------
-    # SCARTARE IMMEDIATAMENTE
-    # --------------------------------------------------
-
-    # 1. Quota diversa da 1/1
-    quota_fraz = trova_quota_frazionaria(t)
-    if quota_fraz:
-        return 0
-
-    # 2. Usufrutto / nuda proprietÃ
-    if contiene(t, ["usufrutto", "nuda proprieta"]):
-        return 0
-
-    # 3. Affittato / locato (contratto attivo)
-    #    REGOLA FONDAMENTALE: "occupato dall'esecutato" NON Ã¨ locazione
-    # Locazione negata esplicitamente nella perizia
-    locazione_negata = trova_regex(t, [
-        r"non\s+sussist\w+\s+.{0,60}contratt[io]\s+di\s+locazione",
-        r"contratt[io]\s+di\s+locazione.{0,80}non\s+risult",
-        r"non\s+risultano.{0,80}contratt[io]\s+di\s+locazione",
-        r"non\s+risultano.{0,80}locazioni",
-        r"non\s+risulta.{0,80}locaz",
-        r"contratt[io]\s+di\s+locazione.{0,30}:\s*no\b",
-        r"locazioni?\s+in\s+essere.{0,20}:\s*no\b",
-        r"non\s+risultano.{0,40}contratt[io]\s+d.affitto",
-        r"non\s+risulta.{0,40}affitt",
-        r"locatore.{0,80}non\s+risultano",
-    ])
-
-    # Locazione reale (contratto attivo confermato)
-    locato_confermato = trova_regex(t, [
-        r"immobile\s+(?:e'|e|risulta)\s+locato",
-        r"immobile\s+(?:e'|e|risulta)\s+affittato",
-        r"in\s+essere\s+(?:un\s+)?contratto\s+di\s+locazione",
-        r"contratto\s+di\s+locazione\s+(?:registrato|stipulato|in\s+corso|attivo|vigente)",
-        r"canone\s+di\s+locazione\s+(?:mensile|annuo|corrisposto)",
-        r"conduttore\s+(?:occupa|detiene|abita)",
-    ])
-
-    if locato_confermato and not locazione_negata:
-        return 0
-
-    # 4. Rudere / collabente / F/2
-    if contiene(t, [
-        "rudere", "inagibile", "fabbricato pericolante",
-        "demolizione", "collabente", "f/2", "categoria f/2",
-        "unita collabente",
-    ]):
-        return 0
-
-    # 5. Solo box / posto auto / cantina  (senza abitazione)
-    parole_abitazione = [
-        "appartamento", "abitazione", "alloggio", "unita abitativa",
-        "villetta", "villa", "casa", "civile abitazione",
-        "abitazione_tipo_civ",
-    ]
-    parole_accessori = [
-        "posto auto", "box", "box auto", "autorimessa",
-        "garage", "cantina", "deposito", "magazzino",
-    ]
-    solo_accessori = (
-        contiene(t, parole_accessori)
-        and not contiene(t, parole_abitazione)
-    )
-    if solo_accessori:
-        return 0
-
-    # --------------------------------------------------
-    # PUNTEGGIO BASE
-    # --------------------------------------------------
-    score = 40
-
-    # --------------------------------------------------
-    # INTERESSANTE  (+punti)
-    # --------------------------------------------------
-
-    # Piena proprietÃ  1/1
-    if ha_quota_intera(t):
-        score += 20
-    if "piena proprieta" in t and not quota_fraz:
-        score += 15
-
-    # Tipo immobile abitativo
-    for parola, punti in [
-        ("appartamento", 12), ("abitazione", 12), ("alloggio", 10),
-        ("unita abitativa", 10), ("villa", 8), ("villetta", 8),
-        ("abitazione_tipo_civ", 10), ("unita immobiliare", 6),
-        ("lotto unico", 5), ("civile abitazione", 10),
-    ]:
-        if parola in t:
-            score += punti
-
-    # Libero / occupato dall'esecutato (NON da terzi)
-    libero = contiene(t, [
-        "non occupato", "non occupata",
-        "libero al sopralluogo", "risulta libero", "risulta libera",
-        "risultato libero", "immobile libero",
-        "libero da persone", "libera da persone",
-        "liber",        # cattura LIBERO/LIBERA dei testi PVP
-    ])
-    occupato_esecutato = trova_regex(t, [
-        r"occupat[oa]\s+dall[''`]?esecutat",
-        r"occupat[oa]\s+dal\s+debitore",
-        r"occupat[oa]\s+dal\s+proprietario",
-        r"occupat[oa]\s+dai\s+proprietari",
-    ])
-
-    if libero:
-        score += 15
-    if trova_regex(t, [r"occupat[oa]\\s+senza\\s+titolo"]):
-        score += 8
-    if occupato_esecutato:
-        score += 10   # occupato dall'esecutato: positivo (piÃ¹ facile del locato)
-
-    # --------------------------------------------------
-    # DA VALUTARE  (penalitÃ  parziali)
-    # --------------------------------------------------
-    warning = {
-        "difformita catastale": 25,
-        "difformita urbanistica": 25,
-        "difformita": 15,
-        "sanatoria": 20,
-        "sanatorie": 20,
-        "abuso edilizio": 30,
-        "abusi edilizi": 30,
-        "opere abusive": 25,
-        "non conforme": 20,
-        "infiltrazioni": 15,
-        "umidita": 10,
-        "impianti da rifare": 15,
-        "impianti da sostituire": 15,
-        "ristrutturazione importante": 20,
-        "ristrutturazione integrale": 25,
-        "ristrutturare": 10,
-    }
-    for parola, penalita in warning.items():
-        if parola in t:
-            score -= penalita
-
-    # Occupato da terzi (NON esecutato, NON locato giÃ  scartato)
-    occupato_terzi = trova_regex(t, [
-        r"occupat[oa]\s+da\s+terz",
-        r"occupat[oa]\s+abusivamente",
-    ])
-    if occupato_terzi:
-        score -= 30
-
-    # --------------------------------------------------
-    # LIMITI
-    # --------------------------------------------------
-    return max(0, min(score, 100))
-
-
-def esito_da_score(score: int) -> str:
-    if score >= SOGLIA_INTERESSANTE:
-        return "INTERESSANTE"
-    if score >= SOGLIA_DA_VALUTARE:
-        return "DA VALUTARE"
-    return "SCARTARE"
-
-
-# =========================================================
-# OCR
-# =========================================================
-
-def estrai_testo_da_pdf(pdf_path: Path) -> str | None:
-    try:
-        pagine = convert_from_path(str(pdf_path), poppler_path=POPPLER)
-        testo  = ""
-        for pagina in pagine:
-            testo += pytesseract.image_to_string(pagina, lang="ita")
-            testo += "\n\n"
-        return testo
-    except Exception as e:
-        log(f"  âœ— Errore OCR su {pdf_path.name}: {e}")
-        return None
-
-
-def analizza_llm_con_cache(testo: str, id_asta: str) -> dict:
-    cache_file = CACHE_LLM_DIR / f"{id_asta}.json"
-    if cache_file.exists():
-        try:
-            return json.loads(cache_file.read_text(encoding="utf-8"))
-        except Exception:
-            pass
-    risultato = analizza_perizia_con_llm(testo)
-    try:
-        cache_file.write_text(
-            json.dumps(risultato, ensure_ascii=False, indent=2),
-            encoding="utf-8"
+        r = httpx.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json"
+            },
+            json={
+                "model": "claude-opus-4-5",
+                "max_tokens": 200,
+                "messages": [{"role": "user", "content": contenuto}]
+            },
+            timeout=120
         )
-    except Exception:
-        pass
-    return risultato
+
+        risposta = r.json()
+        testo = risposta["content"][0]["text"].strip()
+
+        if testo.startswith("```"):
+            testo = testo.split("```")[1]
+            if testo.startswith("json"):
+                testo = testo[4:]
+
+        dati = json.loads(testo)
+        return dati.get("esito"), dati.get("score"), dati.get("note")
+
+    except Exception as e:
+        print(f"Errore API Claude {id_asta}: {e}")
+        return None, None, None
 
 
-# =========================================================
-# PIPELINE PRINCIPALE
-# =========================================================
+for (id_asta,) in da_analizzare:
 
-def main():
-    log("=" * 60)
-    log("AVVIO ANALISI ASTE (modalita' parallela)")
-    log(f"LLM_WORKERS = {LLM_WORKERS}")
-    log("=" * 60)
+    print(f"Analizzo: {id_asta}")
 
-    conn = sqlite3.connect("database/aste.db")
-    cur  = conn.cursor()
+    esito, score, note = analizza_perizia(id_asta)
 
-    for stmt in [
-        "ALTER TABLE aste ADD COLUMN analisi_llm TEXT",
-        "ALTER TABLE aste ADD COLUMN score_llm INTEGER",
-        "ALTER TABLE aste ADD COLUMN score_regex INTEGER",
-    ]:
-        try:
-            cur.execute(stmt)
-        except sqlite3.OperationalError:
-            pass
-    conn.commit()
-
-    cur.execute("""
-        SELECT id, comune, provincia, offerta
-        FROM aste
-        WHERE COALESCE(analizzata, 0) = 0
-        ORDER BY offerta ASC
-    """)
-    aste = cur.fetchall()
-    log(f"Aste da analizzare: {len(aste)}")
-
-    if not aste:
-        log("Nessuna asta da analizzare. Uscita.")
-        conn.close()
-        return
-
-    stats = {
-        "interessante": 0, "da_valutare": 0, "scartare": 0,
-        "errore_testo": 0, "errore_llm": 0, "llm_usato": 0,
-    }
-
-    # ---------------------------------------------------------
-    # FASE 1: Preparazione testi
-    # ---------------------------------------------------------
-    log("\n" + "=" * 60)
-    log("FASE 1: preparazione testi")
-    log("=" * 60)
-
-    testi_pronti = {}
-
-    for idx, (id_asta, comune, provincia, offerta) in enumerate(aste, 1):
-        id_asta = str(id_asta)
-        log(f"[prep {idx}/{len(aste)}] {id_asta} | {comune} | â‚¬{offerta:,.0f}")
-
-        pdf_file = PERIZIE_DIR / f"{id_asta}.pdf"
-        txt_file = TESTI_DIR   / f"{id_asta}.txt"
-
-        testo = None
-        if pdf_file.exists():
-            log(f"  â†’ OCR: {pdf_file.name}")
-            testo = estrai_testo_da_pdf(pdf_file)
-            if testo:
-                try:
-                    txt_file.write_text(testo, encoding="utf-8")
-                except Exception:
-                    pass
-        elif txt_file.exists():
-            testo = txt_file.read_text(encoding="utf-8", errors="ignore")
-            log(f"  â†’ TXT esistente: {txt_file.name}")
-        else:
-            log(f"  âœ— PDF e TXT assenti")
-
-        if testo and len(testo.strip()) >= 50:
-            testi_pronti[id_asta] = testo
-        else:
-            cur.execute("""
-                UPDATE aste SET analizzata=1, score=0, esito='SCARTARE',
-                                analisi_llm='PERIZIA NON DISPONIBILE'
-                WHERE id=?
-            """, (id_asta,))
-            conn.commit()
-            stats["errore_testo"] += 1
-
-    log(f"\nTesti pronti per l'analisi: {len(testi_pronti)}")
-
-    # ---------------------------------------------------------
-    # FASE 2: Score regex
-    # ---------------------------------------------------------
-    log("\n" + "=" * 60)
-    log("FASE 2: calcolo score regex")
-    log("=" * 60)
-
-    candidati_llm  = []
-    risultati_regex = {}
-
-    for id_asta, testo in testi_pronti.items():
-        score_regex = calcola_score_regex(testo)
-        log(f"  {id_asta}: regex={score_regex}")
-
-        if score_regex >= SOGLIA_LLM:
-            candidati_llm.append((id_asta, testo, score_regex))
-        else:
-            risultati_regex[id_asta] = (score_regex, esito_da_score(score_regex))
-
-    log(f"\nAste sopra soglia LLM ({SOGLIA_LLM}): {len(candidati_llm)}")
-
-    # ---------------------------------------------------------
-    # FASE 3: LLM in parallelo
-    # ---------------------------------------------------------
-    risultati_llm = {}
-
-    if candidati_llm:
-        log("\n" + "=" * 60)
-        log(f"FASE 3: analisi LLM parallela ({LLM_WORKERS} worker)")
-        log("=" * 60)
-
-        # PATCH: aggiunta funzione di retry con backoff esponenziale
-        # per gestire instabilità di Ollama sotto carico
-        def chiama_llm_con_retry(testo: str, id_asta: str, max_retry: int = 4) -> dict:
-            for tentativo in range(max_retry):
-                try:
-                    return analizza_llm_con_cache(testo, id_asta)
-                except Exception as e:
-                    wait = min(60, 10 * (tentativo + 1))
-                    log(f"  [LLM] ATTENZIONE {id_asta} tentativo {tentativo+1}/{max_retry} fallito: {type(e).__name__}, riprovo tra {wait}s")
-                    time.sleep(wait)
-            return {"errore": f"fallito dopo {max_retry} tentativi"}
-        # FINE PATCH
-
-        def worker(args):
-            id_asta, testo, score_regex = args
-            log(f"  [LLM] Avvio {id_asta} (regex={score_regex})")
-            # PATCH: uso la funzione con retry
-            analisi = chiama_llm_con_retry(testo, id_asta)
-            # FINE PATCH
-
-            if "errore" in analisi:
-                log(f"  [LLM] âœ— {id_asta}: {str(analisi['errore'])[:80]}")
-                return id_asta, None, score_regex, esito_da_score(score_regex), analisi
-
-            score_llm    = analisi.get("score_qualita")
-            score_finale = unisci_score(score_regex, analisi)
-            esito        = esito_da_score(score_finale)
-            log(f"  [LLM] âœ“ {id_asta}: llm={score_llm} -> finale={score_finale} [{esito}]")
-            return id_asta, score_llm, score_finale, esito, analisi
-
-        with ThreadPoolExecutor(max_workers=LLM_WORKERS) as executor:
-            futures = [executor.submit(worker, c) for c in candidati_llm]
-            for future in as_completed(futures):
-                try:
-                    id_asta, score_llm, score_finale, esito, analisi = future.result()
-                    risultati_llm[id_asta] = (score_llm, score_finale, esito, analisi)
-                except Exception as e:
-                    log(f"  [LLM] âœ— Eccezione nel worker: {e}")
-
-    # ---------------------------------------------------------
-    # FASE 4: Salvataggio DB
-    # ---------------------------------------------------------
-    log("\n" + "=" * 60)
-    log("FASE 4: salvataggio risultati")
-    log("=" * 60)
-
-    for id_asta in testi_pronti.keys():
-        if id_asta in risultati_llm:
-            score_llm, score_finale, esito, analisi_llm = risultati_llm[id_asta]
-            score_regex      = next((c[2] for c in candidati_llm if c[0] == id_asta), None)
-            analisi_llm_json = json.dumps(analisi_llm, ensure_ascii=False)
-            if "errore" in analisi_llm:
-                stats["errore_llm"] += 1
-            else:
-                stats["llm_usato"] += 1
-        else:
-            score_regex, esito = risultati_regex[id_asta]
-            score_llm          = None
-            score_finale       = score_regex
-            analisi_llm_json   = None
-
+    if esito:
         cur.execute("""
             UPDATE aste
-            SET analizzata=1, score=?, esito=?,
-                score_regex=?, score_llm=?, analisi_llm=?
-            WHERE id=?
-        """, (score_finale, esito, score_regex, score_llm, analisi_llm_json, id_asta))
+            SET esito = ?, score = ?, analizzata = 1
+            WHERE id = ?
+        """, (esito, score, id_asta))
         conn.commit()
+        print(f"  → {esito} (score {score})")
+    else:
+        cur.execute("""
+            UPDATE aste SET analizzata = 1 WHERE id = ?
+        """, (id_asta,))
+        conn.commit()
+        print(f"  → non classificata")
 
-        key = {"INTERESSANTE":"interessante","DA VALUTARE":"da_valutare","SCARTARE":"scartare"}.get(esito,"scartare")
-        stats[key] += 1
-        log(f"  âœ“ {id_asta}: {esito} (score={score_finale})")
-
-    # ---------------------------------------------------------
-    # RIEPILOGO
-    # ---------------------------------------------------------
-    log("\n" + "=" * 60)
-    log("RIEPILOGO")
-    log("=" * 60)
-    log(f"  Interessanti : {stats['interessante']}")
-    log(f"  Da valutare  : {stats['da_valutare']}")
-    log(f"  Scartate     : {stats['scartare']}")
-    log(f"  No testo     : {stats['errore_testo']}")
-    log(f"  Errori LLM   : {stats['errore_llm']}")
-    log(f"  LLM usato    : {stats['llm_usato']} volte")
-    log("=" * 60)
-
-    conn.close()
-    log("Analisi completata.")
-
-
-if __name__ == "__main__":
-    main()
+conn.close()
