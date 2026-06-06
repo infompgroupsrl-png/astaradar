@@ -1,0 +1,27 @@
+{
+    "province": [
+        "mi",
+        "co",
+        "lc",
+        "va"
+    ],
+
+    "offerta_massima": 30000,
+
+    "tipologie_ammesse": [
+        "abitazione"
+    ],
+
+    "email_mittente": "autoled2002@yahoo.it",
+
+    "email_destinatario": [
+        "autoled2002@yahoo.it",
+        "studiomodadelcampo@gmail.com"
+    ],
+
+    "password_app": "rypwhpolkbhsxmow",
+
+    "smtp_server": "smtp.mail.yahoo.com",
+
+    "smtp_port": 587
+}
