@@ -20,8 +20,9 @@ jobs:
           python-version: '3.11'
 
       - name: Installa dipendenze
-        run: |
-          pip install -r requirements.txt
+        run: pip install requests pandas openpyxl
 
       - name: Esegui astaradar_run.py
         run: python astaradar_run.py
+        env:
+          PYTHONUNBUFFERED: "1"
