@@ -23,9 +23,10 @@ jobs:
         run: sudo apt-get install -y poppler-utils
 
       - name: Installa dipendenze
-        run: pip install requests pandas openpyxl pdf2image
+        run: pip install requests pandas openpyxl pdf2image httpx
 
       - name: Esegui astaradar_run.py
         run: python astaradar_run.py
         env:
           PYTHONUNBUFFERED: "1"
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
