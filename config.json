@@ -15,7 +15,7 @@
     "email_mittente": "autoled2002@yahoo.it",
 
     "email_destinatario": [
-        "autoled2002@yahoo.it",
+        "autoled2002@yahoo.it"
         
     ],
 
@@ -24,4 +24,5 @@
     "smtp_server": "smtp.mail.yahoo.com",
 
     "smtp_port": 587
+     "anthropic_api_key": "rypwhpolkbhsxmow"
 }
