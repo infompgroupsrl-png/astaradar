@@ -1,28 +1,11 @@
 {
-    "province": [
-        "mi",
-        "co",
-        "lc",
-        "va"
-    ],
-
+    "province": ["mi", "co", "lc", "va"],
     "offerta_massima": 30000,
-
-    "tipologie_ammesse": [
-        "abitazione"
-    ],
-
+    "tipologie_ammesse": ["abitazione"],
     "email_mittente": "autoled2002@yahoo.it",
-
-    "email_destinatario": [
-        "autoled2002@yahoo.it"
-        
-    ],
-
+    "email_destinatario": ["autoled2002@yahoo.it"],
     "password_app": "rypwhpolkbhsxmow",
-
     "smtp_server": "smtp.mail.yahoo.com",
-
-    "smtp_port": 587
-     "anthropic_api_key": "rypwhpolkbhsxmow"
+    "smtp_port": 587,
+    "anthropic_api_key": "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"
 }
